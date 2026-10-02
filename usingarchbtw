@@ -1,0 +1,620 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+SCRIPT_NAME="usingarchbtw"
+MOUNT=/mnt
+DEFAULT_TZ="Europe/Warsaw"
+DEFAULT_HOSTNAME="arch-btw"
+DEFAULT_LOCALE="en_US.UTF-8"
+DEFAULT_KEYMAP="pl"
+ENABLE_FIREWALL="yes"
+ENABLE_BOOT_UPDATE="no"
+SWAP_EXTRA_GIB=2
+
+RED='\033[1;31m'; GREEN='\033[1;32m'; YELLOW='\033[1;33m'; BLUE='\033[1;34m'; RESET='\033[0m'
+
+log()  { printf '%b==>\033[0m %s\n' "${BLUE}" "$*"; }
+ok()   { printf '%b==>\033[0m %s\n' "${GREEN}" "$*"; }
+warn() { printf '%bWARNING:\033[0m %s\n' "${YELLOW}" "$*" >&2; }
+die()  { printf '%bERROR:\033[0m %s\n' "${RED}" "$*" >&2; exit 1; }
+
+cleanup_on_error() {
+    local rc=$?
+    if (( rc != 0 )); then
+        warn "Installation aborted with exit code ${rc}. Filesystems were not automatically unmounted so you can inspect the failure."
+    fi
+}
+trap cleanup_on_error EXIT
+
+require_root() {
+    [[ $EUID -eq 0 ]] || die "Run this from the Arch ISO as root."
+}
+
+preflight() {
+    require_root
+    [[ -d /sys/firmware/efi ]] && BOOT_MODE="UEFI" || BOOT_MODE="BIOS"
+    command -v pacman >/dev/null || die "This does not look like an Arch ISO. pacman is missing."
+    command -v lsblk >/dev/null || die "lsblk is missing."
+
+    if ! ping -c1 -W3 archlinux.org >/dev/null 2>&1; then
+        die "No working network connection. Connect to the network before running ${SCRIPT_NAME}."
+    fi
+
+    RAM_MIB=$(awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo)
+    RAM_GIB=$(( (RAM_MIB + 1023) / 1024 ))
+    SWAP_GIB=$(( RAM_GIB + SWAP_EXTRA_GIB ))
+
+    if (( RAM_GIB < 1 )); then
+        die "Could not determine RAM size."
+    fi
+}
+
+cpu_microcode() {
+    MICROCODE=""
+    case "$(uname -m)" in
+        x86_64)
+            if grep -q GenuineIntel /proc/cpuinfo; then
+                MICROCODE="intel-ucode"
+            elif grep -q AuthenticAMD /proc/cpuinfo; then
+                MICROCODE="amd-ucode"
+            fi
+            ;;
+    esac
+    [[ -n "$MICROCODE" ]] && MICROCODE_NOTE="$MICROCODE" || MICROCODE_NOTE="none detected"
+}
+
+show_disks() {
+    printf '\n%bAvailable block devices:%b\n' "$BLUE" "$RESET"
+    lsblk -e7 -o NAME,SIZE,TYPE,FSTYPE,FSVER,LABEL,MODEL,MOUNTPOINTS
+    printf '\n'
+}
+
+prompt_disk() {
+    while :; do
+        read -r -p "Target disk (e.g. /dev/nvme0n1 or /dev/sda): " DISK
+        [[ -b "$DISK" ]] || { warn "That is not a block device."; continue; }
+        [[ "$DISK" != /dev/* ]] && { warn "Use the full path, e.g. /dev/nvme0n1."; continue; }
+        [[ "$DISK" == /dev/loop* || "$DISK" == /dev/ram* || "$DISK" == /dev/zram* ]] && { warn "That device is not a sane installation target."; continue; }
+        break
+    done
+
+    if [[ "$DISK" =~ [0-9]$ ]]; then
+        PART_PREFIX="${DISK}p"
+    else
+        PART_PREFIX="${DISK}"
+    fi
+}
+
+prompt_choice() {
+    local prompt=$1 var=$2
+    shift 2
+    local -a choices=("$@")
+    local i answer
+    printf '\n%s\n' "$prompt"
+    for i in "${!choices[@]}"; do printf '  %d) %s\n' "$((i+1))" "${choices[$i]}"; done
+    while :; do
+        read -r -p "Choice [1-${#choices[@]}]: " answer
+        if [[ "$answer" =~ ^[0-9]+$ ]] && (( answer >= 1 && answer <= ${#choices[@]} )); then
+            printf -v "$var" '%s' "${choices[$((answer-1))]}"
+            return
+        fi
+        warn "Pick one of the listed numbers."
+    done
+}
+
+prompt_config() {
+    prompt_disk
+
+    read -r -p "System language / locale [${DEFAULT_LOCALE}]: " LOCALE
+    LOCALE=${LOCALE:-$DEFAULT_LOCALE}
+    [[ "$LOCALE" =~ ^[A-Za-z_]+\.[A-Za-z0-9-]+$ ]] || die "Locale must look like en_US.UTF-8 or pl_PL.UTF-8."
+
+    read -r -p "Keyboard layout [${DEFAULT_KEYMAP}]: " KEYMAP
+    KEYMAP=${KEYMAP:-$DEFAULT_KEYMAP}
+
+    read -r -p "Timezone [${DEFAULT_TZ}]: " TIMEZONE
+    TIMEZONE=${TIMEZONE:-$DEFAULT_TZ}
+    [[ -e "/usr/share/zoneinfo/$TIMEZONE" ]] || die "Timezone does not exist in /usr/share/zoneinfo."
+
+    read -r -p "Hostname [${DEFAULT_HOSTNAME}]: " HOSTNAME
+    HOSTNAME=${HOSTNAME:-$DEFAULT_HOSTNAME}
+    [[ "$HOSTNAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$ ]] || die "Invalid hostname."
+
+    prompt_choice "Desktop environment / window manager:" DESKTOP \
+        "GNOME" "KDE Plasma" "Cinnamon Wayland" "niri" "Hyprland"
+
+    case "$DESKTOP" in
+        GNOME) DM="gdm";;
+        "KDE Plasma") DM="sddm";;
+        "Cinnamon Wayland") DM="lightdm";;
+        niri|Hyprland) DM="greetd + Noctalia Greeter";;
+    esac
+
+    read -r -p "Display manager [${DM}]: " DM_INPUT
+    DM_INPUT=${DM_INPUT:-$DM}
+    case "$DM_INPUT" in
+        gdm|GDM) DM="gdm";;
+        sddm|SDDM) DM="sddm";;
+        lightdm|LightDM) DM="lightdm";;
+        greetd|"greetd + Noctalia Greeter"|Noctalia) DM="greetd";;
+        *) die "Unsupported display manager. Use gdm, sddm, lightdm, or greetd.";;
+    esac
+
+    prompt_choice "Graphics driver:" GPU_DRIVER \
+        "Automatic / open-source AMD or Intel" \
+        "NVIDIA proprietary legacy (580xx AUR)" \
+        "NVIDIA open kernel modules (nvidia-open)" \
+        "No extra graphics driver"
+
+    printf "\nOptional services:\n"
+    read -r -p "Enable firewall (firewalld)? [Y/n]: " FIREWALL_INPUT
+    FIREWALL_INPUT=${FIREWALL_INPUT:-Y}
+    case "$FIREWALL_INPUT" in
+        y|Y|yes|YES) ENABLE_FIREWALL="yes";;
+        n|N|no|NO) ENABLE_FIREWALL="no";;
+        *) die "Enter Y or N for the firewall.";;
+    esac
+
+    if [[ "$BOOT_MODE" == UEFI ]]; then
+        read -r -p "Enable systemd-boot-update.service? [y/N]: " BOOT_UPDATE_INPUT
+        BOOT_UPDATE_INPUT=${BOOT_UPDATE_INPUT:-N}
+        case "$BOOT_UPDATE_INPUT" in
+            y|Y|yes|YES) ENABLE_BOOT_UPDATE="yes";;
+            n|N|no|NO) ENABLE_BOOT_UPDATE="no";;
+            *) die "Enter Y or N for systemd-boot-update.service.";;
+        esac
+    fi
+
+    read -r -p "Username: " USERNAME
+    [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "Invalid username."
+    [[ "$USERNAME" != root ]] || die "Do not create a user named root."
+
+    while :; do
+        read -r -s -p "Password (also used for root): " USER_PASSWORD; printf '\n'
+        [[ -n "$USER_PASSWORD" ]] || { warn "Password cannot be empty."; continue; }
+        read -r -s -p "Repeat password: " USER_PASSWORD2; printf '\n'
+        [[ "$USER_PASSWORD" == "$USER_PASSWORD2" ]] && break
+        warn "Passwords do not match. Humanity has invented copy/paste."
+    done
+}
+
+summary_and_confirm() {
+    printf '\n%b============================================================%b\n' "$YELLOW" "$RESET"
+    printf '%b                  KrissTM Arch Install                  %b\n' "$YELLOW" "$RESET"
+    printf '%b============================================================%b\n' "$YELLOW" "$RESET"
+    printf 'Boot mode:        %s\n' "$BOOT_MODE"
+    printf 'Target disk:      %s\n' "$DISK"
+    printf 'Filesystem:       ext4\n'
+    printf 'EFI partition:    %s\n' "$( [[ "$BOOT_MODE" == UEFI ]] && echo '2 GiB' || echo 'none' )"
+    printf 'Swap:             %s GiB (RAM: %s GiB + %s GiB)\n' "$SWAP_GIB" "$RAM_GIB" "$SWAP_EXTRA_GIB"
+    printf 'Root:             remaining disk space\n'
+    printf 'Locale:           %s\n' "$LOCALE"
+    printf 'Keyboard:         %s\n' "$KEYMAP"
+    printf 'Timezone:          %s\n' "$TIMEZONE"
+    printf 'Hostname:          %s\n' "$HOSTNAME"
+    printf 'Desktop/WM:       %s\n' "$DESKTOP"
+    printf 'Display manager:  %s\n' "$DM"
+    printf 'Graphics:         %s\n' "$GPU_DRIVER"
+    printf 'Firewall:         %s\n' "$ENABLE_FIREWALL"
+    printf 'boot-update:      %s\n' "$ENABLE_BOOT_UPDATE"
+    printf 'CPU microcode:    %s\n' "$MICROCODE_NOTE"
+    printf 'User:             %s\n' "$USERNAME"
+    printf 'Secure Boot:      not configured by this installer\n'
+    printf '%b============================================================%b\n\n' "$YELLOW" "$RESET"
+    printf '%bTHIS WILL ERASE EVERYTHING ON %s.%b\n' "$RED" "$DISK" "$RESET"
+    read -r -p "Type CONFIRM to continue: " CONFIRM
+    [[ "$CONFIRM" == "CONFIRM" ]] || die "Confirmation not received. Nothing was touched."
+}
+
+partition_disk() {
+    log "Wiping ${DISK} and creating the partition table."
+    umount -R "$MOUNT" 2>/dev/null || true
+    swapoff -a 2>/dev/null || true
+    wipefs -af "$DISK"
+    sgdisk --zap-all "$DISK"
+    sgdisk --clear "$DISK"
+
+    local disk_bytes swap_bytes
+    disk_bytes=$(blockdev --getsize64 "$DISK")
+    swap_bytes=$(( SWAP_GIB * 1024 * 1024 * 1024 ))
+
+    if (( disk_bytes < swap_bytes + 3 * 1024 * 1024 * 1024 )); then
+        die "Disk is too small for a ${SWAP_GIB} GiB swap partition plus a 2 GiB EFI partition and root."
+    fi
+
+    if [[ "$BOOT_MODE" == UEFI ]]; then
+        sgdisk -n 1:1MiB:+2GiB -t 1:ef00 -c 1:EFI "$DISK"
+        sgdisk -n 2:0:+${SWAP_GIB}GiB -t 2:8200 -c 2:swap "$DISK"
+        sgdisk -n 3:0:0 -t 3:8300 -c 3:root "$DISK"
+        EFI_PART="${PART_PREFIX}1"
+        SWAP_PART="${PART_PREFIX}2"
+        ROOT_PART="${PART_PREFIX}3"
+    else
+        sgdisk -n 1:1MiB:+${SWAP_GIB}GiB -t 1:8200 -c 1:swap "$DISK"
+        sgdisk -n 2:0:0 -t 2:8300 -c 2:root "$DISK"
+        SWAP_PART="${PART_PREFIX}1"
+        ROOT_PART="${PART_PREFIX}2"
+        EFI_PART=""
+    fi
+
+    partprobe "$DISK" || true
+    sleep 2
+}
+
+format_and_mount() {
+    log "Formatting partitions as ext4/FAT32/swap."
+    if [[ "$BOOT_MODE" == UEFI ]]; then
+        mkfs.fat -F32 "$EFI_PART"
+    fi
+    mkswap "$SWAP_PART"
+    swapon "$SWAP_PART"
+    mkfs.ext4 -F "$ROOT_PART"
+
+    mount "$ROOT_PART" "$MOUNT"
+    mkdir -p "$MOUNT/boot"
+    if [[ "$BOOT_MODE" == UEFI ]]; then
+        mount "$EFI_PART" "$MOUNT/boot"
+    fi
+}
+
+pacstrap_base() {
+    local packages=(
+        base linux linux-firmware
+        base-devel sudo networkmanager git curl wget
+        man-db man-pages texinfo pciutils
+        reflector firewalld fstrim
+        pipewire pipewire-audio pipewire-alsa pipewire-pulse pipewire-jack wireplumber
+        xdg-desktop-portal xdg-desktop-portal-gtk
+        bash-completion
+    )
+    [[ -n "$MICROCODE" ]] && packages+=("$MICROCODE")
+    [[ "$BOOT_MODE" == UEFI ]] && packages+=(efibootmgr)
+    [[ "$BOOT_MODE" == BIOS ]] && packages+=(grub)
+
+    log "Installing base system with pacstrap."
+    pacstrap -K "$MOUNT" "${packages[@]}"
+}
+
+write_fstab() {
+    genfstab -U "$MOUNT" > "$MOUNT/etc/fstab"
+    # Swap is a partition, so resume can use its UUID directly.
+    local swap_uuid
+    swap_uuid=$(blkid -s UUID -o value "$SWAP_PART")
+    printf '\n# Hibernate resume\n' >> "$MOUNT/etc/fstab"
+    # No additional fstab entry is needed: genfstab already wrote swap.
+    RESUME_UUID="$swap_uuid"
+}
+
+chroot_cmd() {
+    arch-chroot "$MOUNT" /usr/bin/env \
+        DISK="$DISK" BOOT_MODE="$BOOT_MODE" EFI_PART="$EFI_PART" \
+        SWAP_PART="$SWAP_PART" ROOT_PART="$ROOT_PART" RESUME_UUID="$RESUME_UUID" \
+        LOCALE="$LOCALE" KEYMAP="$KEYMAP" TIMEZONE="$TIMEZONE" HOSTNAME="$HOSTNAME" \
+        DESKTOP="$DESKTOP" DM="$DM" GPU_DRIVER="$GPU_DRIVER" \
+        ENABLE_FIREWALL="$ENABLE_FIREWALL" ENABLE_BOOT_UPDATE="$ENABLE_BOOT_UPDATE" \
+        USERNAME="$USERNAME" USER_PASSWORD="$USER_PASSWORD" \
+        MICROCODE="$MICROCODE" bash -s
+}
+
+configure_system() {
+    log "Configuring the installed system."
+    chroot_cmd <<'CHROOT'
+set -Eeuo pipefail
+
+ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+hwclock --systohc
+
+sed -i "s/^#\($LOCALE[[:space:]]*\)/\1/" /etc/locale.gen
+if ! grep -q "^${LOCALE}[[:space:]]" /etc/locale.gen; then
+    printf '%s UTF-8\n' "${LOCALE%%.*}" >> /etc/locale.gen
+fi
+locale-gen
+printf 'LANG=%s\n' "$LOCALE" > /etc/locale.conf
+printf 'KEYMAP=%s\n' "$KEYMAP" > /etc/vconsole.conf
+printf '%s\n' "$HOSTNAME" > /etc/hostname
+
+cat > /etc/hosts <<EOF_HOSTS
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
+EOF_HOSTS
+
+# Enable multilib.
+if ! grep -q '^\[multilib\]' /etc/pacman.conf; then
+    cat >> /etc/pacman.conf <<'EOF_MULTILIB'
+
+[multilib]
+Include = /etc/pacman.d/mirrorlist
+EOF_MULTILIB
+fi
+
+pacman -Sy --noconfirm
+
+# Refresh mirrors. If reflector cannot reach a mirror service, retain the existing mirrorlist.
+reflector --country Poland,Germany,Netherlands --protocol https --latest 20 --sort rate --save /etc/pacman.d/mirrorlist || true
+pacman -Syu --noconfirm
+
+# Hibernate: resume from the swap partition.
+if grep -q '^HOOKS=' /etc/mkinitcpio.conf; then
+    sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block filesystems resume fsck)/' /etc/mkinitcpio.conf
+else
+    printf '%s\n' 'HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block filesystems resume fsck)' >> /etc/mkinitcpio.conf
+fi
+mkdir -p /etc/modprobe.d
+mkinitcpio -P
+
+# Root and user account. Same password by design, because that was requested.
+useradd -m -G wheel -s /bin/bash "$USERNAME"
+printf 'root:%s\n' "$USER_PASSWORD" | chpasswd
+printf '%s:%s\n' "$USERNAME" "$USER_PASSWORD" | chpasswd
+printf '%%wheel ALL=(ALL:ALL) ALL\n' > /etc/sudoers.d/10-wheel
+chmod 0440 /etc/sudoers.d/10-wheel
+
+systemctl enable NetworkManager.service
+systemctl enable fstrim.timer
+if [[ "$ENABLE_FIREWALL" == yes ]]; then
+    systemctl enable firewalld.service
+else
+    systemctl disable firewalld.service 2>/dev/null || true
+fi
+
+# Display manager selection.
+for unit in gdm.service sddm.service lightdm.service greetd.service; do
+    systemctl disable "$unit" 2>/dev/null || true
+done
+
+# Common portal packages are already installed; add the session-specific backend below.
+case "$DESKTOP" in
+    GNOME)
+        pacman -S --noconfirm gnome gnome-extra gdm xdg-desktop-portal-gnome
+        systemctl enable gdm.service
+        ;;
+    "KDE Plasma")
+        pacman -S --noconfirm plasma-meta kde-applications sddm xdg-desktop-portal-kde
+        systemctl enable sddm.service
+        ;;
+    "Cinnamon Wayland")
+        pacman -S --noconfirm cinnamon cinnamon-translations lightdm lightdm-gtk-greeter xdg-desktop-portal-xapp
+        systemctl enable lightdm.service
+        ;;
+    niri)
+        pacman -S --noconfirm niri noctalia xdg-desktop-portal-gnome xwayland-satellite greetd accountsservice
+        ;;
+    Hyprland)
+        pacman -S --noconfirm hyprland noctalia xdg-desktop-portal-hyprland xdg-desktop-portal-gtk xwayland-satellite greetd accountsservice
+        ;;
+esac
+
+# Graphics.
+case "$GPU_DRIVER" in
+    "Automatic / open-source AMD or Intel")
+        pacman -S --noconfirm mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon vulkan-intel lib32-vulkan-intel
+        ;;
+    "NVIDIA open kernel modules (nvidia-open)")
+        pacman -S --noconfirm nvidia-open nvidia-utils lib32-nvidia-utils nvidia-prime
+        ;;
+    "NVIDIA proprietary legacy (580xx AUR)")
+        # The legacy 580xx packages are AUR packages and therefore cannot be installed by pacman here.
+        # yay is installed later, but we need the package after yay exists. Mark it for the post-user stage.
+        printf '%s\n' 'nvidia-580xx-dkms nvidia-580xx-utils lib32-nvidia-580xx-utils nvidia-prime' > /root/usingarchbtw-nvidia-580xx
+        ;;
+    "No extra graphics driver")
+        ;;
+esac
+
+# NVIDIA DRM modesetting is useful for Wayland. This does not force NVIDIA on non-NVIDIA systems.
+if [[ "$GPU_DRIVER" == "NVIDIA open kernel modules (nvidia-open)" || "$GPU_DRIVER" == "NVIDIA proprietary legacy (580xx AUR)" ]]; then
+    printf 'options nvidia_drm modeset=1\n' > /etc/modprobe.d/nvidia.conf
+    sed -i 's/^MODULES=.*/MODULES=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)/' /etc/mkinitcpio.conf || true
+    mkinitcpio -P
+fi
+
+# Bootloader.
+if [[ "$BOOT_MODE" == UEFI ]]; then
+    bootctl --path=/boot install
+    mkdir -p /boot/loader/entries
+    cat > /boot/loader/loader.conf <<'EOF_LOADER'
+default arch.conf
+timeout 3
+editor no
+EOF_LOADER
+    cat > /boot/loader/entries/arch.conf <<EOF_ENTRY
+title   Arch Linux
+linux   /vmlinuz-linux
+initrd  /${MICROCODE:-intel-ucode}.img
+initrd  /initramfs-linux.img
+options root=UUID=$(blkid -s UUID -o value "$ROOT_PART") rw quiet resume=UUID=$RESUME_UUID
+EOF_ENTRY
+    # Correct the microcode line when no microcode package was detected.
+    if [[ -z "$MICROCODE" ]]; then
+        sed -i '/^initrd  \/.*-ucode.img$/d' /boot/loader/entries/arch.conf
+    fi
+else
+    grub-install --target=i386-pc "$DISK"
+    ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+    sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"root=UUID=${ROOT_UUID} rw quiet resume=UUID=${RESUME_UUID}\"|" /etc/default/grub
+    grub-mkconfig -o /boot/grub/grub.cfg
+fi
+
+# Optional systemd-boot update service.
+if [[ "$BOOT_MODE" == UEFI && "$ENABLE_BOOT_UPDATE" == yes ]]; then
+    systemctl enable systemd-boot-update.service
+else
+    systemctl disable systemd-boot-update.service 2>/dev/null || true
+fi
+
+# Noctalia user service for Niri/Hyprland. It is a user service, deliberately not a root service.
+if [[ "$DESKTOP" == niri || "$DESKTOP" == Hyprland ]]; then
+    install -d -m 0755 -o "$USERNAME" -g "$USERNAME" "/home/$USERNAME/.config/systemd/user"
+    cat > "/home/$USERNAME/.config/systemd/user/noctalia.service" <<'EOF_NOCTALIA'
+[Unit]
+Description=Noctalia Desktop Shell
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/noctalia
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+EOF_NOCTALIA
+    chown "$USERNAME:$USERNAME" "/home/$USERNAME/.config/systemd/user/noctalia.service"
+
+    # It is started explicitly by the compositor after importing the graphical session environment.
+fi
+
+# Generate compositor configs from the packages' shipped defaults, then add only the requested Noctalia startup hook.
+if [[ "$DESKTOP" == niri ]]; then
+    install -d -m 0755 -o "$USERNAME" -g "$USERNAME" "/home/$USERNAME/.config/niri"
+    cp /usr/share/doc/niri/default-config.kdl "/home/$USERNAME/.config/niri/config.kdl"
+    sed -i 's|^[[:space:]]*// layout "us,ru"$|                layout "'"$KEYMAP"'"|' "/home/$USERNAME/.config/niri/config.kdl"
+    chown "$USERNAME:$USERNAME" "/home/$USERNAME/.config/niri/config.kdl"
+    printf '\n// usingarchbtw: start Noctalia v5 through its user systemd service\nspawn-sh-at-startup "systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DBUS_SESSION_BUS_ADDRESS && systemctl --user start noctalia.service"\n' >> "/home/$USERNAME/.config/niri/config.kdl"
+    chown "$USERNAME:$USERNAME" "/home/$USERNAME/.config/niri/config.kdl"
+fi
+
+if [[ "$DESKTOP" == Hyprland ]]; then
+    install -d -m 0755 -o "$USERNAME" -g "$USERNAME" "/home/$USERNAME/.config/hypr"
+    # Arch's Hyprland package ships the matching upstream example Lua config.
+    cp /usr/share/hypr/hyprland.lua "/home/$USERNAME/.config/hypr/hyprland.lua"
+    cat >> "/home/$USERNAME/.config/hypr/hyprland.lua" <<EOF_HYPR_LUA
+
+-- usingarchbtw: keyboard layout and Noctalia v5 startup
+hl.config({ input = { kb_layout = "$KEYMAP" } })
+hl.on("hyprland.start", function()
+    hl.exec_cmd("dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DBUS_SESSION_BUS_ADDRESS")
+    hl.exec_cmd("systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DBUS_SESSION_BUS_ADDRESS")
+    hl.exec_cmd("systemctl --user start noctalia.service")
+end)
+EOF_HYPR_LUA
+    chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/.config/hypr"
+fi
+
+# Install yay as the normal user.
+if ! command -v yay >/dev/null 2>&1; then
+    tmpdir=$(mktemp -d)
+    chown "$USERNAME:$USERNAME" "$tmpdir"
+    runuser -u "$USERNAME" -- bash -c "cd '$tmpdir' && git clone https://aur.archlinux.org/yay.git && cd yay && makepkg -si --noconfirm"
+    rm -rf "$tmpdir"
+fi
+
+# 580xx NVIDIA legacy branch is AUR-based. Refuse if the package names are no longer available rather than silently installing something else.
+if [[ -f /root/usingarchbtw-nvidia-580xx ]]; then
+    mapfile -t NVIDIA580_PKGS < /root/usingarchbtw-nvidia-580xx
+    if ! runuser -u "$USERNAME" -- yay -Si nvidia-580xx-dkms >/dev/null 2>&1; then
+        echo "ERROR: nvidia-580xx-dkms is not currently available in the configured AUR." >&2
+        echo "The system was installed, but the requested legacy NVIDIA driver was not installed." >&2
+        rm -f /root/usingarchbtw-nvidia-580xx
+        exit 1
+    fi
+    runuser -u "$USERNAME" -- yay -S --noconfirm --needed "${NVIDIA580_PKGS[@]}"
+    rm -f /root/usingarchbtw-nvidia-580xx
+fi
+
+# Noctalia Greeter is an AUR package. Install only when greetd was selected.
+if [[ "$DM" == greetd ]]; then
+    runuser -u "$USERNAME" -- yay -S --noconfirm --needed noctalia-greeter
+    cat > /etc/greetd/config.toml <<EOF_GREETD
+[terminal]
+vt = 1
+
+[default_session]
+command = "agreety --cmd /usr/bin/niri-session"
+user = "greeter"
+EOF_GREETD
+    case "$DESKTOP" in
+        niri) GREETER_SESSION="niri-session";;
+        Hyprland) GREETER_SESSION="start-hyprland";;
+        GNOME) GREETER_SESSION="gnome-session";;
+        "KDE Plasma") GREETER_SESSION="startplasma-wayland";;
+        "Cinnamon Wayland") GREETER_SESSION="cinnamon-session --session cinnamon-wayland";;
+    esac
+    cat > /etc/greetd/config.toml <<EOF_GREETD
+[terminal]
+vt = 1
+
+[default_session]
+command = "noctalia-greeter-session -- $GREETER_SESSION"
+user = "greeter"
+EOF_GREETD
+    /usr/share/noctalia-greeter/setup_greeter_system.sh 2>/dev/null || true
+    systemctl enable greetd.service
+fi
+
+# Cinnamon Wayland needs the actual Wayland session selected. LightDM can present the session chooser.
+if [[ "$DESKTOP" == "Cinnamon Wayland" ]]; then
+    if [[ ! -f /usr/share/wayland-sessions/cinnamon-wayland.desktop ]]; then
+        echo "Cinnamon Wayland session was not installed as expected." >&2
+        exit 1
+    fi
+fi
+
+# Make sure portal selection is explicit for wlroots compositors.
+if [[ "$DESKTOP" == Hyprland ]]; then
+    install -d /etc/xdg/xdg-desktop-portal
+    cat > /etc/xdg/xdg-desktop-portal/portals.conf <<'EOF_PORTAL'
+[preferred]
+default=gtk
+org.freedesktop.impl.portal.ScreenCast=hyprland
+org.freedesktop.impl.portal.Screenshot=hyprland
+EOF_PORTAL
+elif [[ "$DESKTOP" == niri ]]; then
+    install -d /etc/xdg/xdg-desktop-portal
+    cat > /etc/xdg/xdg-desktop-portal/portals.conf <<'EOF_PORTAL_NIRI'
+[preferred]
+default=gnome
+org.freedesktop.impl.portal.Screenshot=gnome
+org.freedesktop.impl.portal.ScreenCast=gnome
+EOF_PORTAL_NIRI
+fi
+
+# Final package sync and initramfs after all driver/config changes.
+pacman -Syu --noconfirm
+mkinitcpio -P
+
+# Ensure password hashes are not accidentally exposed in the environment after this point.
+unset USER_PASSWORD
+
+# Validate critical files.
+[[ -s /etc/fstab ]] || { echo 'fstab missing' >&2; exit 1; }
+[[ -x /usr/bin/systemctl ]] || { echo 'systemctl missing' >&2; exit 1; }
+[[ "$BOOT_MODE" != UEFI || -f /boot/loader/entries/arch.conf ]] || { echo 'systemd-boot entry missing' >&2; exit 1; }
+[[ "$BOOT_MODE" != BIOS || -f /boot/grub/grub.cfg ]] || { echo 'GRUB config missing' >&2; exit 1; }
+
+printf '\nInstallation configuration complete.\n'
+CHROOT
+}
+
+finish() {
+    sync
+    printf '\n%bInstallation finished.%b\n' "$GREEN" "$RESET"
+    printf 'Boot mode: %s\n' "$BOOT_MODE"
+    printf 'Filesystem: ext4\n'
+    printf 'Root: %s\n' "$ROOT_PART"
+    printf 'Swap: %s (%s GiB)\n' "$SWAP_PART" "$SWAP_GIB"
+    printf 'User: %s\n' "$USERNAME"
+    printf 'Desktop/WM: %s\n' "$DESKTOP"
+    printf 'Display manager: %s\n' "$DM"
+    printf 'Hostname: %s\n' "$HOSTNAME"
+    printf '\nSecure Boot was not configured. If your firmware requires it, handle that separately.\n'
+    printf 'You can now unmount /mnt and reboot.\n'
+}
+
+main() {
+    preflight
+    cpu_microcode
+    show_disks
+    prompt_config
+    summary_and_confirm
+    partition_disk
+    format_and_mount
+    pacstrap_base
+    write_fstab
+    configure_system
+    finish
+}
+
+main "$@"
