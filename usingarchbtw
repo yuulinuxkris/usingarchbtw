@@ -37,10 +37,11 @@ preflight() {
     [[ -d /sys/firmware/efi ]] && BOOT_MODE="UEFI" || BOOT_MODE="BIOS"
     command -v pacman >/dev/null || die "This does not look like an Arch ISO. pacman is missing."
     command -v lsblk >/dev/null || die "lsblk is missing."
-
+    log "Checking network connectivity..."
     if ! ping -c1 -W3 archlinux.org >/dev/null 2>&1; then
-        die "No working network connection. Connect to the network before running ${SCRIPT_NAME}."
+        die "No working network connection."
     fi
+    ok "Network is working."
 
     RAM_MIB=$(awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo)
     RAM_GIB=$(( (RAM_MIB + 1023) / 1024 ))
@@ -264,7 +265,7 @@ pacstrap_base() {
         base linux linux-firmware
         base-devel sudo networkmanager git curl wget
         man-db man-pages texinfo pciutils
-        reflector firewalld fstrim
+        reflector firewalld util-linux
         pipewire pipewire-audio pipewire-alsa pipewire-pulse pipewire-jack wireplumber
         xdg-desktop-portal xdg-desktop-portal-gtk
         bash-completion
