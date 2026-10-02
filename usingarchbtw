@@ -211,37 +211,64 @@ summary_and_confirm() {
 
 partition_disk() {
     log "Wiping ${DISK} and creating the partition table."
+
     umount -R "$MOUNT" 2>/dev/null || true
     swapoff -a 2>/dev/null || true
+
     wipefs -af "$DISK"
     sgdisk --zap-all "$DISK"
     sgdisk --clear "$DISK"
 
-    local disk_bytes swap_bytes
+    local disk_bytes swap_bytes minimum_bytes
     disk_bytes=$(blockdev --getsize64 "$DISK")
     swap_bytes=$(( SWAP_GIB * 1024 * 1024 * 1024 ))
 
-    if (( disk_bytes < swap_bytes + 3 * 1024 * 1024 * 1024 )); then
-        die "Disk is too small for a ${SWAP_GIB} GiB swap partition plus a 2 GiB EFI partition and root."
-    fi
-
     if [[ "$BOOT_MODE" == UEFI ]]; then
+        # UEFI:
+        #   2 GiB EFI System Partition
+        #   RAM + 2 GiB swap
+        #   remaining space for ext4 root
+        minimum_bytes=$(( swap_bytes + 3 * 1024 * 1024 * 1024 ))
+
+        if (( disk_bytes < minimum_bytes )); then
+            die "Disk is too small for a 2 GiB EFI partition, ${SWAP_GIB} GiB swap, and root."
+        fi
+
         sgdisk -n 1:1MiB:+2GiB -t 1:ef00 -c 1:EFI "$DISK"
         sgdisk -n 2:0:+${SWAP_GIB}GiB -t 2:8200 -c 2:swap "$DISK"
         sgdisk -n 3:0:0 -t 3:8300 -c 3:root "$DISK"
+
         EFI_PART="${PART_PREFIX}1"
         SWAP_PART="${PART_PREFIX}2"
         ROOT_PART="${PART_PREFIX}3"
+
     else
-        sgdisk -n 1:1MiB:+${SWAP_GIB}GiB -t 1:8200 -c 1:swap "$DISK"
-        sgdisk -n 2:0:0 -t 2:8300 -c 2:root "$DISK"
-        SWAP_PART="${PART_PREFIX}1"
-        ROOT_PART="${PART_PREFIX}2"
+        # BIOS + GPT:
+        #   1 MiB BIOS Boot Partition for GRUB
+        #   RAM + 2 GiB swap
+        #   remaining space for ext4 root
+        #
+        # The BIOS Boot partition is intentionally NOT formatted.
+        minimum_bytes=$(( swap_bytes + 2 * 1024 * 1024 * 1024 ))
+
+        if (( disk_bytes < minimum_bytes )); then
+            die "Disk is too small for a ${SWAP_GIB} GiB swap partition and root."
+        fi
+
+        sgdisk -n 1:1MiB:+1MiB -t 1:ef02 -c 1:BIOS-Boot "$DISK"
+        sgdisk -n 2:0:+${SWAP_GIB}GiB -t 2:8200 -c 2:swap "$DISK"
+        sgdisk -n 3:0:0 -t 3:8300 -c 3:root "$DISK"
+
+        SWAP_PART="${PART_PREFIX}2"
+        ROOT_PART="${PART_PREFIX}3"
         EFI_PART=""
     fi
 
     partprobe "$DISK" || true
     sleep 2
+
+    log "Partitioning complete:"
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,PARTTYPE,MOUNTPOINTS "$DISK"
 }
 
 format_and_mount() {
