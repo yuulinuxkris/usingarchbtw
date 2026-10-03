@@ -295,7 +295,7 @@ pacstrap_base() {
         reflector firewalld util-linux
         pipewire pipewire-audio pipewire-alsa pipewire-pulse pipewire-jack wireplumber
         xdg-desktop-portal xdg-desktop-portal-gtk
-        alacritty ghostty kitty
+        alacritty ghostty kitty nano vim nvim
         bash-completion
     )
     [[ -n "$MICROCODE" ]] && packages+=("$MICROCODE")
